@@ -250,6 +250,14 @@ class ControlMode(Enum):
     PROMPT = "My prompt is more important"
     CONTROL = "ControlNet is more important"
 
+    def int_value(self):
+        if self == ControlMode.BALANCED:
+            return 0
+        elif self == ControlMode.PROMPT:
+            return 1
+        elif self == ControlMode.CONTROL:
+            return 2
+        assert False, "NOTREACHED"
 
 class BatchOption(Enum):
     DEFAULT = "All ControlNet units for all images in a batch"
