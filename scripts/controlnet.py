@@ -125,10 +125,12 @@ def prepare_mask(
     Returns:
         mask (Image.Image): The prepared mask as a PIL Image object.
     """
+    # Convert the mask to grayscale
     mask = mask.convert("L")
     if getattr(p, "inpainting_mask_invert", False):
         mask = ImageOps.invert(mask)
 
+    # Apply blur if needed
     if hasattr(p, 'mask_blur_x'):
         if getattr(p, "mask_blur_x", 0) > 0:
             np_mask = np.array(mask)
@@ -145,6 +147,91 @@ def prepare_mask(
             mask = mask.filter(ImageFilter.GaussianBlur(p.mask_blur))
 
     return mask
+
+def choose_input_image(
+        p: processing.StableDiffusionProcessing,
+        unit: ControlNetUnit,
+        idx: int
+    ) -> Tuple[np.ndarray, ResizeMode]:
+    """ Choose input image from following sources with descending priority:
+     - p.image_control: [Deprecated] Lagacy way to pass image to controlnet.
+     - p.control_net_input_image: [Deprecated] Lagacy way to pass image to controlnet.
+     - unit.image: ControlNet unit input image.
+     - p.init_images: A1111 img2img input image.
+
+    Returns:
+        - The input image in ndarray form.
+        - The resize mode.
+    """
+    def from_rgba_to_input(img: np.ndarray) -> np.ndarray:
+        if (
+            shared.opts.data.get("controlnet_ignore_noninpaint_mask", False) or
+            (img[:, :, 3] <= 5).all() or
+            (img[:, :, 3] >= 250).all()
+        ):
+            # Take RGB
+            return img[:, :, :3]
+        logger.info("Canvas scribble mode. Using mask scribble as input.")
+        return HWC3(img[:, :, 3])
+
+    # 4 input image sources.
+    p_image_control = getattr(p, "image_control", None)
+    p_input_image = Script.get_remote_call(p, "control_net_input_image", None, idx)
+    image = unit.get_input_images_rgba()
+    a1111_image = getattr(p, "init_images", [None])[0]
+
+    resize_mode = unit.resize_mode
+
+    if batch_hijack.instance.is_batch and p_image_control is not None:
+        logger.warning("Warn: Using legacy field 'p.image_control'.")
+        input_image = HWC3(np.asarray(p_image_control))
+    elif p_input_image is not None:
+        logger.warning("Warn: Using legacy field 'p.controlnet_input_image'")
+        if isinstance(p_input_image, dict) and "mask" in p_input_image and "image" in p_input_image:
+            color = HWC3(np.asarray(p_input_image['image']))
+            alpha = np.asarray(p_input_image['mask'])[..., None]
+            input_image = np.concatenate([color, alpha], axis=2)
+        else:
+            input_image = HWC3(np.asarray(p_input_image))
+    elif image is not None:
+        assert isinstance(image, list)
+        # Inpaint mask or CLIP mask.
+        if unit.is_inpaint or unit.uses_clip:
+            # RGBA
+            input_image = image
+        else:
+            # RGB
+            input_image = [from_rgba_to_input(img) for img in image]
+
+        if len(input_image) == 1:
+            input_image = input_image[0]
+    elif a1111_image is not None:
+        input_image = HWC3(np.asarray(a1111_image))
+        a1111_i2i_resize_mode = getattr(p, "resize_mode", None)
+        assert a1111_i2i_resize_mode is not None
+        resize_mode = external_code.resize_mode_from_value(a1111_i2i_resize_mode)
+
+        a1111_mask_image : Optional[Image.Image] = getattr(p, "image_mask", None)
+        if unit.is_inpaint:
+            if a1111_mask_image is not None:
+                a1111_mask = np.array(prepare_mask(a1111_mask_image, p))
+                assert a1111_mask.ndim == 2
+                assert a1111_mask.shape[0] == input_image.shape[0]
+                assert a1111_mask.shape[1] == input_image.shape[1]
+                input_image = np.concatenate([input_image[:, :, 0:3], a1111_mask[:, :, None]], axis=2)
+            else:
+                input_image = np.concatenate([
+                    input_image[:, :, 0:3],
+                    np.zeros_like(input_image, dtype=np.uint8)[:, :, 0:1],
+                ], axis=2)
+    else:
+        # No input image detected.
+        if batch_hijack.instance.is_batch:
+            shared.state.interrupted = True
+        raise ValueError("controlnet is enabled but no input image is given")
+
+    assert isinstance(input_image, (np.ndarray, list))
+    return input_image, resize_mode
 
 
 def set_numpy_seed(p: processing.StableDiffusionProcessing) -> Optional[int]:
@@ -307,6 +394,10 @@ class Script(scripts.Script, metaclass=(
         self.post_processors = []
         self.noise_modifier = None
         self.ui_batch_option_state = [BatchOption.DEFAULT.value, False]
+        # `Script` instance is created twice, once for img2img and once for txt2img.
+        # However, A1111 does not pass is_img2img to script constructor, so this field
+        # is initialized in `ui` method.
+        self.is_img2img = False
         batch_hijack.instance.process_batch_callbacks.append(self.batch_tab_process)
         batch_hijack.instance.process_batch_each_callbacks.append(self.batch_tab_process_each)
         batch_hijack.instance.postprocess_batch_each_callbacks.insert(0, self.batch_tab_postprocess_each)
@@ -366,6 +457,8 @@ class Script(scripts.Script, metaclass=(
         The return value should be an array of all components that are used in processing.
         Values of those returned components will be passed to run() and process() functions.
         """
+        self.is_img2img = is_img2img
+
         infotext = Infotext()
         ui_groups = []
         controls = []
@@ -660,8 +753,8 @@ class Script(scripts.Script, metaclass=(
             idx: int
         ) -> Tuple[np.ndarray, ResizeMode]:
         """ Choose input image from following sources with descending priority:
-         - p.image_control: [Deprecated] Lagacy way to pass image to controlnet.
-         - p.control_net_input_image: [Deprecated] Lagacy way to pass image to controlnet.
+         - p.image_control: [Deprecated] Legacy way to pass image to controlnet.
+         - p.control_net_input_image: [Deprecated] Legacy way to pass image to controlnet.
          - unit.image: ControlNet unit input image.
          - p.init_images: A1111 img2img input image.
 
@@ -717,7 +810,7 @@ class Script(scripts.Script, metaclass=(
             assert a1111_i2i_resize_mode is not None
             resize_mode = external_code.resize_mode_from_value(a1111_i2i_resize_mode)
 
-            a1111_mask_image : Optional[Image.Image] = getattr(p, "image_mask", None)
+            a1111_mask_image: Optional[Image.Image] = getattr(p, "image_mask", None)
             if unit.is_inpaint:
                 if a1111_mask_image is not None:
                     a1111_mask = np.array(prepare_mask(a1111_mask_image, p))
@@ -736,8 +829,17 @@ class Script(scripts.Script, metaclass=(
                 shared.state.interrupted = True
             raise ValueError("controlnet is enabled but no input image is given")
 
-        assert isinstance(input_image, (np.ndarray, list))
+        # Prioritize the Effective Region Mask if provided
+        if unit.effective_region_mask is not None:
+            logger.info("Using effective region mask.")
+            mask_pixel = unit.effective_region_mask
+            if mask_pixel.ndim == 3:
+                mask_pixel = mask_pixel[:, :, None]
+            input_image = np.concatenate([input_image[:, :, 0:3], mask_pixel[:, :, :, 0]], axis=2)
+
+        assert isinstance(input_image, (np.ndarray, list)), f"Expected np.ndarray or list, but got {type(input_image)}"
         return input_image, resize_mode
+
 
     @staticmethod
     def try_crop_image_with_a1111_mask(
@@ -882,8 +984,9 @@ class Script(scripts.Script, metaclass=(
 
         # Unload unused preprocessors
         Preprocessor.unload_unused(active_processors={
-            unit.get_actual_preprocessor()
+            p
             for unit in self.enabled_units
+            for p in unit.get_actual_preprocessors()
         })
         high_res_fix = isinstance(p, StableDiffusionProcessingTxt2Img) and getattr(p, 'enable_hr', False)
 
@@ -941,7 +1044,7 @@ class Script(scripts.Script, metaclass=(
             elif unit.is_animate_diff_batch or control_model_type in [ControlModelType.SparseCtrl]:
                 cn_ad_keyframe_idx = getattr(unit, "batch_keyframe_idx", None)
                 def ad_process_control(cc: List[torch.Tensor], cn_ad_keyframe_idx=cn_ad_keyframe_idx):
-                    if unit.accepts_multiple_inputs:
+                    if unit.is_ipadapter:
                         ip_adapter_image_emb_cond = []
                         model_net.ipadapter.image_proj_model.to(torch.float32) # noqa
                         for c in cc:
@@ -968,7 +1071,7 @@ class Script(scripts.Script, metaclass=(
                                 for frame_idx, frame_path in zip(unit.batch_keyframe_idx, unit.batch_image_files):
                                     logger.info(f"\t{frame_idx}: {frame_path}")
                             c = SparseCtrl.create_cond_mask(cn_ad_keyframe_idx, c, p.batch_size).cpu()
-                        elif unit.accepts_multiple_inputs:
+                        elif unit.is_ipadapter:
                             # ip-adapter should do prompt travel
                             logger.info("IP-Adapter: control prompts will be traveled in the following way:")
                             for frame_idx, frame_path in zip(unit.batch_keyframe_idx, unit.batch_image_files):
@@ -1020,6 +1123,10 @@ class Script(scripts.Script, metaclass=(
                 control_model_type.is_controlnet and
                 model_net.control_model.global_average_pooling
             )
+
+            if control_model_type == ControlModelType.ControlNetUnion:
+                logger.info(f"ControlNetUnion control type: {unit.union_control_type}")
+
             forward_param = ControlParams(
                 control_model=model_net,
                 preprocessor=preprocessor_dict,
@@ -1040,6 +1147,8 @@ class Script(scripts.Script, metaclass=(
                     if unit.effective_region_mask is not None
                     else None
                 ),
+                # TODO: Implement merge of units with the same union model.
+                union_control_types=[unit.union_control_type],
             )
             forward_params.append(forward_param)
 
@@ -1295,11 +1404,19 @@ class Script(scripts.Script, metaclass=(
             tracemalloc.stop()
 
     def batch_tab_process(self, p, batches, *args, **kwargs):
+        is_img2img = isinstance(p, StableDiffusionProcessingImg2Img)
+        if is_img2img != self.is_img2img:
+            return
+
         self.enabled_units = Script.get_enabled_units(p)
         for unit_i, unit in enumerate(self.enabled_units):
             unit.batch_images = iter([batch[unit_i] for batch in batches])
 
     def batch_tab_process_each(self, p, *args, **kwargs):
+        is_img2img = isinstance(p, StableDiffusionProcessingImg2Img)
+        if is_img2img != self.is_img2img:
+            return
+
         for unit in self.enabled_units:
             if getattr(unit, 'loopback', False) and batch_hijack.instance.batch_index > 0:
                 continue
@@ -1307,6 +1424,10 @@ class Script(scripts.Script, metaclass=(
             unit.image = next(unit.batch_images)
 
     def batch_tab_postprocess_each(self, p, processed, *args, **kwargs):
+        is_img2img = isinstance(p, StableDiffusionProcessingImg2Img)
+        if is_img2img != self.is_img2img:
+            return
+
         for unit_i, unit in enumerate(self.enabled_units):
             if getattr(unit, 'loopback', False):
                 output_images = getattr(processed, 'images', [])[processed.index_of_first_image:]
@@ -1316,6 +1437,10 @@ class Script(scripts.Script, metaclass=(
                     logger.warning(f'Warning: No loopback image found for controlnet unit {unit_i}. Using control map from last batch iteration instead')
 
     def batch_tab_postprocess(self, p, *args, **kwargs):
+        is_img2img = isinstance(p, StableDiffusionProcessingImg2Img)
+        if is_img2img != self.is_img2img:
+            return
+
         self.enabled_units.clear()
         self.input_image = None
         if self.latest_network is None:
